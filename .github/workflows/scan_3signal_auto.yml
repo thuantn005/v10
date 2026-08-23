@@ -1,0 +1,317 @@
+name: Scan 3Signal Auto
+
+on:
+  workflow_dispatch:
+    inputs:
+      min_j1:
+        description: "Muc J1 toi thieu de log"
+        required: true
+        default: "2"
+      batch_start:
+        description: "Seed bat dau batch"
+        required: true
+        default: "1"
+      batch_size:
+        description: "So seed moi runner"
+        required: true
+        default: "972000"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+
+  scan:
+    name: Scan chunk ${{ matrix.chunk }}
+    strategy:
+      fail-fast: false
+      matrix:
+        chunk: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    runs-on: ubuntu-latest
+    timeout-minutes: 370
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download dataset
+        run: |
+          set -e
+          mkdir -p data
+          curl -sL "https://raw.githubusercontent.com/NhanAZ-Data/vietlott-research/main/datasets/draws/lotto535/all.csv" -o data/all.csv
+          wc -l data/all.csv
+
+      - name: Calculate seed range
+        env:
+          BATCH_START: ${{ github.event.inputs.batch_start }}
+          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+          CHUNK: ${{ matrix.chunk }}
+        run: |
+          set -e
+          python3 << 'PY' >> "$GITHUB_ENV"
+          import os
+          batch_start = int(os.environ["BATCH_START"])
+          batch_size = int(os.environ["BATCH_SIZE"])
+          chunk = int(os.environ["CHUNK"])
+          scan_start = batch_start + chunk * batch_size
+          scan_end = scan_start + batch_size - 1
+          print(f"SCAN_START={scan_start}")
+          print(f"SCAN_END={scan_end}")
+          PY
+
+      - name: Scan chunk (3 dau hieu lich su)
+        env:
+          CSV_PATH: data/all.csv
+          OUT_PATH: results/chunk_${{ matrix.chunk }}.json
+          MIN_LOG: ${{ github.event.inputs.min_j1 }}
+          SCAN_START: ${{ env.SCAN_START }}
+          SCAN_END: ${{ env.SCAN_END }}
+        run: |
+          set -e
+          mkdir -p results
+          python3 scan_3signal.py
+
+      - name: Validate result
+        env:
+          OUT_PATH: results/chunk_${{ matrix.chunk }}.json
+          EXPECTED_START: ${{ env.SCAN_START }}
+          EXPECTED_END: ${{ env.SCAN_END }}
+        run: |
+          set -e
+          test -f "$OUT_PATH"
+          python3 << 'PY'
+          import json, os, sys
+          path = os.environ["OUT_PATH"]
+          with open(path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+          start = int(os.environ["EXPECTED_START"])
+          end = int(os.environ["EXPECTED_END"])
+          expected = end - start + 1 if start <= end else 0
+          scanned = data.get("scanned", 0)
+          print(f"expected={expected} scanned={scanned} completed={data.get('completed')}")
+          if expected > 0 and scanned < expected:
+              print("ERROR: chunk chua quet du seed")
+              sys.exit(2)
+          print("OK")
+          PY
+
+      - name: Create chunk manifest
+        env:
+          CHUNK: ${{ matrix.chunk }}
+          START: ${{ env.SCAN_START }}
+          END: ${{ env.SCAN_END }}
+        run: |
+          set -e
+          python3 << 'PY'
+          import json, os
+          from pathlib import Path
+          chunk = int(os.environ["CHUNK"])
+          start = int(os.environ["START"])
+          end = int(os.environ["END"])
+          count = end - start + 1 if start <= end else 0
+          data = {"chunk": chunk, "status": "completed",
+                  "scan_start": start, "scan_end": end,
+                  "expected_seeds": count, "result_file": f"chunk_{chunk}.json"}
+          Path(f"results/chunk_{chunk}.manifest.json").write_text(
+              json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+          PY
+
+      - name: Upload chunk artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sig3-chunk-${{ matrix.chunk }}
+          path: |
+            results/chunk_${{ matrix.chunk }}.json
+            results/chunk_${{ matrix.chunk }}.manifest.json
+          if-no-files-found: ignore
+          retention-days: 14
+
+  merge:
+    name: Merge batch
+    needs: scan
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Download all chunk artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sig3-chunk-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: Verify chunks
+        run: |
+          set -e
+          python3 << 'PY'
+          import json, sys
+          from pathlib import Path
+          artifacts = Path("artifacts")
+          missing = []
+          for i in range(20):
+              files = list(artifacts.glob(f"sig3-chunk-{i}/chunk_{i}.json"))
+              manifests = list(artifacts.glob(f"sig3-chunk-{i}/chunk_{i}.manifest.json"))
+              if not files or not manifests:
+                  missing.append(i); continue
+              try:
+                  manifest = json.loads(manifests[0].read_text(encoding="utf-8"))
+                  if manifest.get("status") != "completed":
+                      missing.append(i)
+              except Exception:
+                  missing.append(i)
+          print("MISSING:", missing)
+          if missing:
+              sys.exit(1)
+          print("ALL CHUNKS OK")
+          PY
+
+      - name: Merge results
+        env:
+          BATCH_START: ${{ github.event.inputs.batch_start }}
+          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+        run: |
+          set -e
+          mkdir -p results
+          python3 << 'PY'
+          import json, os
+          from pathlib import Path
+
+          batch_start = int(os.environ["BATCH_START"])
+          batch_size = int(os.environ["BATCH_SIZE"])
+
+          all_by_level = {2: [], 3: [], 4: []}
+          total_scanned = 0
+
+          for i in range(20):
+              path = Path(f"artifacts/sig3-chunk-{i}/chunk_{i}.json")
+              data = json.loads(path.read_text(encoding="utf-8"))
+              total_scanned += int(data.get("scanned", 0))
+              rbl = data.get("results_by_level", {})
+              for lvl in (2, 3, 4):
+                  all_by_level[lvl].extend(rbl.get(str(lvl), []))
+
+          def dedup(items):
+              best = {}
+              for r in items:
+                  if "seed" not in r: continue
+                  s = int(r["seed"]); j1 = int(r.get("j1_count", 0))
+                  if s not in best or j1 > int(best[s].get("j1_count", 0)):
+                      best[s] = r
+              return sorted(best.values(), key=lambda x: (-int(x.get("j1_count", 0)), int(x.get("seed", 0))))
+
+          batch_by_level = {lvl: dedup(all_by_level[lvl]) for lvl in (2, 3, 4)}
+
+          old_by_level = {2: [], 3: [], 4: []}
+          old_scanned = 0
+          for lvl in (2, 3, 4):
+              try:
+                  old = json.loads(Path(f"results/final_j1_{lvl}plus.json").read_text(encoding="utf-8"))
+                  old_by_level[lvl] = old.get("results", [])
+                  if lvl == 2:
+                      old_scanned = old.get("total_scanned", 0)
+              except Exception:
+                  pass
+
+          for lvl in (2, 3, 4):
+              final = dedup(old_by_level[lvl] + batch_by_level[lvl])
+              output = {
+                  "batch_start": batch_start,
+                  "batch_end": batch_start + 20*batch_size - 1,
+                  "total_scanned": old_scanned + total_scanned,
+                  "found": len(final),
+                  "results": final,
+              }
+              Path(f"results/final_j1_{lvl}plus.json").write_text(json.dumps(output, ensure_ascii=False, indent=2), encoding="utf-8")
+              print(f"J1>={lvl}: found={len(final)}")
+              for r in final[:10]:
+                  print(f"  seed={r.get('seed')} J1={r.get('j1_count')}")
+
+          print(f"Total scanned: {old_scanned + total_scanned:,}")
+          PY
+
+      - name: Commit results
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git stash push -u -m "final.json truoc khi rebase"
+          git pull --rebase origin main
+          git stash pop
+          git add results/final_j1_2plus.json results/final_j1_3plus.json results/final_j1_4plus.json
+          if git diff --cached --quiet; then
+            echo "Nothing to commit"
+            exit 0
+          fi
+          git commit -m "3signal scan: batch ${{ github.event.inputs.batch_start }}"
+          git push origin main
+
+  next-batch:
+    name: Trigger next batch (vo han cho den khi tim thay J1>=4)
+    needs: merge
+    if: ${{ success() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Kiem tra J1>=4, neu chua co thi chay tiep vo han
+        env:
+          BATCH_START: ${{ github.event.inputs.batch_start }}
+          BATCH_SIZE: ${{ github.event.inputs.batch_size }}
+          MIN_J1: ${{ github.event.inputs.min_j1 }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          python3 << 'PY'
+          import json, os, urllib.request
+          from pathlib import Path
+
+          batch_start = int(os.environ["BATCH_START"])
+          batch_size = int(os.environ["BATCH_SIZE"])
+          min_j1 = os.environ["MIN_J1"]
+          runners = 20
+
+          found_4plus = 0
+          try:
+              data = json.loads(Path("results/final_j1_4plus.json").read_text(encoding="utf-8"))
+              found_4plus = data.get("found", 0)
+          except Exception as e:
+              print("Khong doc duoc final_j1_4plus.json:", e)
+
+          if found_4plus > 0:
+              print("DA TIM THAY SEED J1>=4 -- DUNG QUET!")
+              raise SystemExit(0)
+
+          next_start = batch_start + runners * batch_size
+
+          payload = {"ref": "main", "inputs": {
+              "min_j1": min_j1,
+              "batch_start": str(next_start),
+              "batch_size": str(batch_size),
+          }}
+          req = urllib.request.Request(
+              "https://api.github.com/repos/thuantn005/v10/actions/workflows/scan_3signal_auto.yml/dispatches",
+              data=json.dumps(payload).encode("utf-8"),
+              method="POST",
+              headers={
+                  "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=30) as resp:
+              print("Trigger batch tiep:", resp.status, "start=", next_start)
+          PY
